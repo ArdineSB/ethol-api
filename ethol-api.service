@@ -6,7 +6,7 @@ After=network-online.target
 Type=simple
 User=hermes
 WorkingDirectory=/home/hermes/ethol-api
-ExecStart=/usr/bin/node --experimental-strip-types ethol.ts serve
+ExecStart=/home/hermes/.local/node/bin/node --experimental-strip-types ethol.ts serve
 Restart=always
 RestartSec=5
 Environment=NODE_NO_WARNINGS=1
