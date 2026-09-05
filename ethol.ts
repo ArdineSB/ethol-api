@@ -8,6 +8,7 @@ const DIR = dirname(fileURLToPath(import.meta.url))
 const COOKIE_FILE = join(DIR, ".cookie")
 const SEEN_FILE = join(DIR, ".seen.json")
 const PORT = 8787
+const TG = "https://api.telegram.org/bot"
 
 const WRITE = new Set([
   "/notifikasi/mahasiswa-baca-notif",
@@ -96,19 +97,52 @@ type Notif = {
   kodeNotifikasi?: string
   keterangan?: string
   waktuNotifikasi?: string
-  status?: string
 }
-type Course = { nomor: number; matakuliah: { nama: string }; dosen: string }
+type Course = { nomor: number; jenisSchema: number; matakuliah: { nama: string }; dosen: string }
+type Tugas = { title: string; deadline_indonesia?: string; submission_time?: string | null }
+type Materi = { title: string; tipe?: number }
 
 function esc(s: string) {
   return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]!))
 }
 
+async function courses(): Promise<Course[]> {
+  return (await get("/kuliah", { tahun: "2026", semester: "1" })) as Course[]
+}
+
 async function data() {
   const badge = (await get("/notifikasi/mahasiswa-belum-baca")) as { jumlah: number }
   const notifications = (await get("/notifikasi/mahasiswa", { filterNotif: "SEMUA" })) as Notif[]
-  const courses = (await get("/kuliah", { tahun: "2026", semester: "1" })) as Course[]
-  return { badge: badge.jumlah, notifications, courses }
+  return { badge: badge.jumlah, notifications, courses: await courses() }
+}
+
+function clip(s: string, n = 3900) {
+  return s.length <= n ? s : s.slice(0, n) + "\n…"
+}
+
+async function textTugas(): Promise<string> {
+  const cs = await courses()
+  const lines: string[] = []
+  for (const c of cs) {
+    const items = (await get("/tugas", { kuliah: String(c.nomor), jenisSchema: String(c.jenisSchema) })) as Tugas[]
+    if (!items?.length) continue
+    lines.push(c.matakuliah.nama)
+    for (const t of items) {
+      const st = t.submission_time ? "sudah" : "belum"
+      lines.push(`- ${t.title} · ${t.deadline_indonesia ?? "?"} · ${st}`)
+    }
+    lines.push("")
+  }
+  return clip(lines.join("\n").trim() || "Tidak ada tugas.")
+}
+
+async function textMateri(nomor: string, js: string): Promise<string> {
+  const cs = await courses()
+  const c = cs.find((x) => String(x.nomor) === nomor)
+  const items = (await get("/materi", { matakuliah: nomor, jenis_schema: js })) as Materi[]
+  const head = c ? c.matakuliah.nama : nomor
+  if (!items?.length) return `${head}\n(tidak ada materi)`
+  return clip([head, ...items.map((m) => `- ${m.title}`)].join("\n"))
 }
 
 function selfCheck() {
@@ -129,8 +163,8 @@ function json(res: import("node:http").ServerResponse, code: number, body: unkno
 }
 
 async function htmlPage(): Promise<string> {
-  const { badge, courses } = await data()
-  const lis = courses.map((c) => `<li>${esc(c.matakuliah.nama)} <span class="muted">— ${esc(c.dosen)}</span></li>`).join("\n")
+  const { badge, courses: cs } = await data()
+  const lis = cs.map((c) => `<li>${esc(c.matakuliah.nama)} <span class="muted">— ${esc(c.dosen)}</span></li>`).join("\n")
   return `<!doctype html><meta charset="utf-8"><title>ethol-api</title>
 <style>
 body{font:16px/1.4 system-ui;max-width:42rem;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}
@@ -139,15 +173,29 @@ body{font:16px/1.4 system-ui;max-width:42rem;margin:2rem auto;padding:0 1rem;bac
 </style>
 <h1>ethol-api</h1>
 <p>Lonceng belum dibaca: <span class="badge">${badge}</span></p>
-<p>Matakuliah: <strong>${courses.length}</strong></p>
-<ol>${lis}</ol>
-<p class="muted">Live GET. Tidak mark-read, tidak presensi.</p>`
+<p>Matakuliah: <strong>${cs.length}</strong></p>
+<ol>${lis}</ol>`
 }
 
-async function telegramTick() {
-  const token = env("TELEGRAM_BOT_TOKEN")
-  const chat = env("TELEGRAM_CHAT_ID")
-  if (!token || !chat) return
+const menuKb = {
+  keyboard: [[{ text: "Tugas" }, { text: "Materi" }]],
+  resize_keyboard: true,
+}
+
+async function tg(token: string, method: string, body: unknown) {
+  const r = await fetch(`${TG}${token}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) console.error("tg", method, r.status, (await r.text()).slice(0, 160))
+}
+
+async function send(token: string, chat: string, text: string, extra: Record<string, unknown> = {}) {
+  await tg(token, "sendMessage", { chat_id: chat, text, ...extra })
+}
+
+async function telegramTick(token: string, chat: string) {
   const { notifications } = await data()
   let seen: number[] = []
   try {
@@ -155,23 +203,68 @@ async function telegramTick() {
   } catch { /* first run */ }
   const ids = notifications.map((n) => n.idNotifikasi)
   if (seen.length === 0) {
-    // ponytail: first run seeds, no flood of old notifs
     writeFileSync(SEEN_FILE, JSON.stringify(ids))
     console.log("telegram: seeded", ids.length)
     return
   }
   const have = new Set(seen)
-  const fresh = notifications.filter((n) => !have.has(n.idNotifikasi))
-  for (const n of fresh) {
-    const text = [n.kodeNotifikasi, n.keterangan, n.waktuNotifikasi].filter(Boolean).join("\n")
-    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chat, text: text || String(n.idNotifikasi) }),
-    })
-    if (!r.ok) console.error("telegram send", r.status, await r.text().then((t) => t.slice(0, 120)))
+  for (const n of notifications.filter((x) => !have.has(x.idNotifikasi))) {
+    await send(token, chat, [n.kodeNotifikasi, n.keterangan, n.waktuNotifikasi].filter(Boolean).join("\n") || String(n.idNotifikasi))
   }
   writeFileSync(SEEN_FILE, JSON.stringify([...new Set([...ids, ...seen])].slice(0, 500)))
+}
+
+async function handleMsg(token: string, chat: string, text: string) {
+  const t = text.trim()
+  if (t === "/start" || t === "/menu") {
+    await send(token, chat, "Menu: Tugas atau Materi.", { reply_markup: menuKb })
+    return
+  }
+  if (t === "/tugas" || t === "Tugas") {
+    await send(token, chat, "Ambil tugas…")
+    await send(token, chat, await textTugas())
+    return
+  }
+  if (t === "/materi" || t === "Materi") {
+    const cs = await courses()
+    const buttons = cs.map((c) => [{
+      text: c.matakuliah.nama.slice(0, 60),
+      callback_data: `m:${c.nomor}:${c.jenisSchema}`,
+    }])
+    await send(token, chat, "Pilih matakuliah:", { reply_markup: { inline_keyboard: buttons } })
+    return
+  }
+}
+
+async function telegramInbox(token: string, allow: string) {
+  await tg(token, "setMyCommands", {
+    commands: [
+      { command: "tugas", description: "List tugas" },
+      { command: "materi", description: "List materi (pilih matkul)" },
+      { command: "menu", description: "Tampilkan menu" },
+    ],
+  })
+  let offset = 0
+  for (;;) {
+    try {
+      const r = await fetch(`${TG}${token}/getUpdates?timeout=50&offset=${offset}`)
+      const data = (await r.json()) as { ok?: boolean; result?: any[] }
+      for (const u of data.result ?? []) {
+        offset = u.update_id + 1
+        const msg = u.message
+        const cb = u.callback_query
+        if (msg?.text && String(msg.chat.id) === allow) await handleMsg(token, allow, msg.text)
+        if (cb?.data && String(cb.message?.chat?.id) === allow) {
+          await tg(token, "answerCallbackQuery", { callback_query_id: cb.id })
+          const m = /^m:(\d+):(\d+)$/.exec(cb.data)
+          if (m) await send(token, allow, await textMateri(m[1], m[2]))
+        }
+      }
+    } catch (e) {
+      console.error("inbox", e instanceof Error ? e.message : e)
+      await new Promise((r) => setTimeout(r, 3000))
+    }
+  }
 }
 
 function serve() {
@@ -189,7 +282,7 @@ function serve() {
         return
       }
       if (url === "/v1/courses") {
-        json(res, 200, { courses: (await data()).courses })
+        json(res, 200, { courses: await courses() })
         return
       }
       res.writeHead(404)
@@ -200,13 +293,13 @@ function serve() {
   })
   s.listen(PORT, "127.0.0.1", () => {
     console.log(`http://127.0.0.1:${PORT}/`)
-    console.log("GET /v1/notifications  GET /v1/courses")
-    if (env("TELEGRAM_BOT_TOKEN") && env("TELEGRAM_CHAT_ID")) {
-      telegramTick().catch((e) => console.error(e))
-      setInterval(() => telegramTick().catch((e) => console.error(e)), 5 * 60 * 1000)
-    } else {
-      console.log("telegram off — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
-    }
+    const token = env("TELEGRAM_BOT_TOKEN")
+    const chat = env("TELEGRAM_CHAT_ID")
+    if (token && chat) {
+      telegramTick(token, chat).catch((e) => console.error(e))
+      setInterval(() => telegramTick(token, chat).catch((e) => console.error(e)), 5 * 60 * 1000)
+      telegramInbox(token, chat).catch((e) => console.error(e))
+    } else console.log("telegram off")
   })
 }
 
@@ -214,8 +307,7 @@ const [cmd, ...rest] = process.argv.slice(2)
 if (cmd === "--self-check") selfCheck()
 else if (cmd === "serve") serve()
 else if (!cmd || cmd === "-h") {
-  console.log(`node --experimental-strip-types ethol.ts serve
-node --experimental-strip-types ethol.ts /notifikasi/mahasiswa-belum-baca`)
+  console.log(`node --experimental-strip-types ethol.ts serve`)
 } else {
   get(cmd, parseParams(rest)).then((d) => console.log(JSON.stringify(d, null, 2)), (e) => {
     console.error(e.message)
