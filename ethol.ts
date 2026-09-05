@@ -162,7 +162,10 @@ async function textTugas(cookie: string, file: string): Promise<string> {
     const open = (items ?? []).filter((t) => !t.submission_time)
     if (!open.length) continue
     lines.push(c.matakuliah.nama)
-    for (const t of open) lines.push(`- ${t.title} · ${t.deadline_indonesia ?? "?"}`)
+    const page = `https://ethol.pens.ac.id/mahasiswa/matakuliah/${c.nomor}/tugas`
+    for (const t of open) {
+      lines.push(`- ${t.title} · ${t.deadline_indonesia ?? "?"}\n  ${page}`)
+    }
     lines.push("")
   }
   return clip(lines.join("\n").trim() || "Tidak ada tugas belum dikumpulkan.")
