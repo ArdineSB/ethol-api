@@ -10,14 +10,14 @@ Design a mobile-first web app called **ethol-manager** for PENS students. It is 
 
 Product: one student, already connected. Show live-looking academic data. Dark theme, charcoal/navy surfaces, one accent color (muted teal, like a night campus dashboard). Dense but breathable. Large numbers, short labels. No purple SaaS, no Inter-everywhere generic startup look. Use a distinctive display type for titles (something like Instrument Serif or Newsreader) and a tight sans for data (IBM Plex Sans or similar).
 
-Do **not** include: auto attendance / tombol Presensi yang submit hadir, mark-as-read on notifications, payment, social feed, onboarding carousel, AI chatbot.
+Do **not** include: mark-as-read on notifications, payment, social feed, onboarding carousel, AI chatbot.
 
 Data examples (real shape):
 - Unread bell: 6
 - 11 courses this semester (Ganjil 2026/2027)
 - Sample courses: Workshop Sistem Informasi Geografis (Weny Mistarika Rahmawati), Praktikum Basis Data Lanjut (Selvia Ferdiana Kusuma), Statistika dan Probabilitas (Alfi Fadliana), Metodologi Agile, Konsep Jaringan, Pemrograman Berorientasi Obyek
 - 1 assignment not submitted
-- Attendance history exists; Presensi button on campus is often disabled until lecturer opens it — in this app show status “Tertutup” or “Dosen baru buka” as a badge + link “Buka di ETHOL”, never a submit-hadir button
+- Attendance history exists. Presensi on campus is often disabled until lecturer opens it — show status “Tertutup” or “Dosen baru buka”.
 
 Screens (generate all):
 
@@ -25,7 +25,7 @@ Screens (generate all):
 Top bar: app name ethol-manager, small avatar A, bell with red badge 6.
 Welcome: “Sabtu, 5 September” / nama mahasiswa.
 Three stat cards: 6 Notifikasi, 11 Matakuliah, 1 Tugas belum.
-If any class has open attendance: a slim alert “Presensi dibuka — Workshop SIG” with secondary button “Buka ETHOL”.
+If any class has open attendance: a slim alert “Presensi dibuka — Workshop SIG”.
 List “Hari ini / minggu ini” as course chips with day + time (e.g. Kamis 13:50–16:20 · C.106).
 Bottom nav: Beranda, Kuliah, Tugas, Notifikasi, Profil.
 
@@ -35,7 +35,7 @@ Search field. List of 11 courses: name, lecturer, class code (3 STr IT D). Tap �
 3) **Detail kuliah**
 Course title, lecturer, schedule, room.
 Section Riwayat presensi (table: date, status hadir) — read only.
-Section status presensi sesi ini: badge Tertutup (gray) or Terbuka (teal). CTA is only “Buka di ETHOL” (external). No “Hadir sekarang” / no auto absen.
+Section status presensi sesi ini: badge Tertutup (gray) or Terbuka (teal).
 Links: Materi, Tugas (placeholders OK).
 
 4) **Tugas**
