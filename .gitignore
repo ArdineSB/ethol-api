@@ -1,3 +1,4 @@
 .cookie
 .env
 .seen.json
+sessions/
