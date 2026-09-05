@@ -1,0 +1,15 @@
+[Unit]
+Description=ethol-api
+After=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+WorkingDirectory=/home/hermes/ethol-api
+ExecStart=/usr/bin/node --experimental-strip-types ethol.ts serve
+Restart=always
+RestartSec=5
+Environment=NODE_NO_WARNINGS=1
+
+[Install]
+WantedBy=multi-user.target
