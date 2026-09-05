@@ -1,0 +1,7 @@
+{
+  "type": "module",
+  "scripts": {
+    "serve": "node --experimental-strip-types ethol.ts serve",
+    "ethol": "node --experimental-strip-types ethol.ts"
+  }
+}
