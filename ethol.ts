@@ -7,13 +7,13 @@ const BASE = "https://ethol.pens.ac.id/api"
 const DIR = dirname(fileURLToPath(import.meta.url))
 const COOKIE_FILE = join(DIR, ".cookie")
 const SEEN_FILE = join(DIR, ".seen.json")
+const PRE_FILE = join(DIR, ".presensi.json")
 const SESS_DIR = join(DIR, "sessions")
 const PORT = 8787
 const TG = "https://api.telegram.org/bot"
 
 const WRITE = new Set([
   "/notifikasi/mahasiswa-baca-notif",
-  "/presensi/mahasiswa",
   "/presensi/buka",
   "/presensi/tutup",
   "/presensi/batalkan",
@@ -39,6 +39,10 @@ function parseParams(args: string[]): Record<string, string> {
 function assertGettable(path: string) {
   const p = path.split("?")[0]
   if (WRITE.has(p)) throw new Error(`blocked write: ${p}`)
+}
+
+function assertPostable(path: string) {
+  if (path !== "/presensi/mahasiswa") throw new Error(`blocked write: ${path}`)
 }
 
 function env(k: string): string | undefined {
@@ -122,10 +126,54 @@ async function get(path: string, params: Record<string, string> = {}, cookie = l
   }
 }
 
+async function post(path: string, body: unknown, cookie = loadCookie(), file = COOKIE_FILE, retried = false): Promise<unknown> {
+  assertPostable(path)
+  const res = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: { cookie, accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  const text = await res.text()
+  if (res.status === 401 && !retried) {
+    const next = await refresh(cookie, file)
+    return post(path, body, next, file, true)
+  }
+  if (!res.ok) throw new Error(`${res.status} ${path}: ${text.slice(0, 200)}`)
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
 type Notif = { idNotifikasi: number; kodeNotifikasi?: string; keterangan?: string; waktuNotifikasi?: string }
-type Course = { nomor: number; jenisSchema: number; matakuliah: { nama: string }; dosen: string }
+type Course = { nomor: number; jenisSchema: number; matakuliah: { nama: string }; dosen: string; kuliah_asal?: number | null }
 type Tugas = { title: string; deadline_indonesia?: string; submission_time?: string | null }
 type Materi = { title: string; path?: string; tipe?: number }
+type Slot = {
+  matakuliah?: string
+  nomor_hari?: number
+  jam_awal?: string
+  jam_akhir?: string
+  ruang?: string
+  kode_kelas?: string
+  pararel?: string
+}
+type Me = { nomor: number; nama?: string }
+type Sesi = { open?: number; key: string }
+type Riwayat = { key: string }
+type PresensiCfg = { enabled: boolean; timer: boolean; hours: number; minutes: number; seen: Record<string, number> }
+type PresensiHit = {
+  nama: string
+  kuliah: number
+  jenis_schema: number
+  key: string
+  already: boolean
+  payload: { kuliah: number; jenis_schema: number; mahasiswa: number; key: string; kuliah_asal: number | null }
+  firstSeen: number
+  ready: boolean
+  waitMs: number
+}
 
 function esc(s: string) {
   return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]!))
@@ -180,15 +228,208 @@ async function textMateri(cookie: string, file: string, nomor: string, js: strin
   return clip([head, ...items.map((m) => `- ${m.title}\n  ${href(m.path ?? "")}`)].join("\n"))
 }
 
+const HARI = [
+  { v: 1, n: "Senin" },
+  { v: 2, n: "Selasa" },
+  { v: 3, n: "Rabu" },
+  { v: 4, n: "Kamis" },
+  { v: 5, n: "Jumat" },
+  { v: 6, n: "Sabtu" },
+  { v: 0, n: "Minggu" },
+]
+
+function jam(s?: string) {
+  return s ? String(s).slice(0, 5) : "—"
+}
+
+async function textJadwal(cookie: string, file: string): Promise<string> {
+  const raw = await get("/jadwal/jadwal-online", { tahun: "2026", semester: "1" }, cookie, file)
+  const rows = (Array.isArray(raw) ? raw : (raw as { data?: Slot[] })?.data ?? []) as Slot[]
+  const seen = new Set<string>()
+  const uniq: Slot[] = []
+  for (const u of rows) {
+    const k = `${u.matakuliah}|${u.nomor_hari}|${u.kode_kelas}|${u.pararel}`
+    if (seen.has(k)) continue
+    seen.add(k)
+    uniq.push(u)
+  }
+  const lines: string[] = []
+  for (const d of HARI) {
+    const items = uniq.filter((u) => u.nomor_hari === d.v).sort((a, b) => jam(a.jam_awal).localeCompare(jam(b.jam_awal)))
+    if (!items.length) continue
+    lines.push(d.n)
+    for (const u of items) {
+      lines.push(`- ${u.matakuliah ?? "?"} · ${jam(u.jam_awal)}–${jam(u.jam_akhir)} · ${u.ruang ?? "—"}`)
+    }
+    lines.push("")
+  }
+  return clip(lines.join("\n").trim() || "Tidak ada jadwal.")
+}
+
+function defaultCfg(): PresensiCfg {
+  return { enabled: false, timer: false, hours: 0, minutes: 0, seen: {} }
+}
+
+function loadCfg(): PresensiCfg {
+  try {
+    const j = JSON.parse(readFileSync(PRE_FILE, "utf8")) as Partial<PresensiCfg>
+    return {
+      enabled: !!j.enabled,
+      timer: !!j.timer,
+      hours: Number.isFinite(j.hours) && (j.hours as number) >= 0 ? Math.floor(j.hours as number) : 0,
+      minutes: Number.isFinite(j.minutes) && (j.minutes as number) >= 0 ? Math.floor(j.minutes as number) : 0,
+      seen: j.seen && typeof j.seen === "object" ? j.seen : {},
+    }
+  } catch {
+    return defaultCfg()
+  }
+}
+
+function saveCfg(c: PresensiCfg) {
+  writeFileSync(PRE_FILE, JSON.stringify(c, null, 2))
+}
+
+function delayMs(c: PresensiCfg) {
+  return (c.hours * 60 + c.minutes) * 60 * 1000
+}
+
+function seenKey(kuliah: number, js: number, key: string) {
+  return `${kuliah}:${js}:${key}`
+}
+
+async function scanPresensi(cookie: string, file: string, now = Date.now()): Promise<{ cfg: PresensiCfg; hits: PresensiHit[] }> {
+  const cfg = loadCfg()
+  const me = (await get("/auth/validasi-token", {}, cookie, file)) as Me
+  if (!me?.nomor) throw new Error("no mahasiswa nomor")
+  const cs = await courses(cookie, file)
+  const hits: PresensiHit[] = []
+  const live = new Set<string>()
+  for (const c of cs) {
+    const js = c.jenisSchema
+    const aktif = (await get("/presensi/aktif-kuliah", { kuliah: String(c.nomor), jenis_schema: String(js) }, cookie, file)) as Sesi[]
+    const open = (aktif ?? []).find((s) => s.open === 1)
+    if (!open?.key) continue
+    const sk = seenKey(c.nomor, js, open.key)
+    live.add(sk)
+    const riwayat = (await get("/presensi/riwayat", { kuliah: String(c.nomor), jenis_schema: String(js), nomor: String(me.nomor) }, cookie, file)) as Riwayat[]
+    const already = (riwayat ?? []).some((r) => r.key === open.key)
+    const firstSeen = cfg.seen[sk] ?? now
+    cfg.seen[sk] = firstSeen
+    const wait = cfg.timer ? Math.max(0, firstSeen + delayMs(cfg) - now) : 0
+    hits.push({
+      nama: c.matakuliah.nama,
+      kuliah: c.nomor,
+      jenis_schema: js,
+      key: open.key,
+      already,
+      payload: {
+        kuliah: c.nomor,
+        jenis_schema: js,
+        mahasiswa: me.nomor,
+        key: open.key,
+        kuliah_asal: c.kuliah_asal ?? null,
+      },
+      firstSeen,
+      ready: !already && wait === 0,
+      waitMs: wait,
+    })
+  }
+  cfg.seen = Object.fromEntries(Object.entries(cfg.seen).filter(([k]) => live.has(k)))
+  saveCfg(cfg)
+  return { cfg, hits }
+}
+
+function fmtWait(ms: number) {
+  const s = Math.ceil(ms / 1000)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  return h ? `${h}j ${m}m` : `${m}m`
+}
+
+function textPresensiScan(cfg: PresensiCfg, hits: PresensiHit[]) {
+  const head = `toggle ${cfg.enabled ? "on" : "off"} · timer ${cfg.timer ? "on" : "off"} ${cfg.hours}j ${cfg.minutes}m`
+  if (!hits.length) return `${head}\nTidak ada presensi terbuka.`
+  const lines = [head, ""]
+  for (const h of hits) {
+    const st = h.already ? "sudah hadir" : h.ready ? "siap POST" : `tunggu ${fmtWait(h.waitMs)}`
+    lines.push(`${h.nama} · ${st}`)
+    lines.push(`  ${JSON.stringify(h.payload)}`)
+  }
+  return lines.join("\n")
+}
+
+async function cmdPresensi(args: string[]) {
+  const a = args[0]
+  if (a === "on" || a === "off") {
+    const c = loadCfg()
+    c.enabled = a === "on"
+    saveCfg(c)
+    console.log(`toggle ${c.enabled ? "on" : "off"}`)
+    return
+  }
+  if (a === "timer") {
+    const c = loadCfg()
+    const b = args[1]
+    if (b === "on" || b === "off") {
+      c.timer = b === "on"
+      saveCfg(c)
+      console.log(`timer ${c.timer ? "on" : "off"} ${c.hours}j ${c.minutes}m`)
+      return
+    }
+    if (args.length >= 3) {
+      const hours = Number(args[1])
+      const minutes = Number(args[2])
+      if (!Number.isInteger(hours) || hours < 0 || !Number.isInteger(minutes) || minutes < 0) {
+        throw new Error("timer jam menit = angka ≥ 0")
+      }
+      c.timer = true
+      c.hours = hours
+      c.minutes = minutes
+      saveCfg(c)
+      console.log(`timer on ${c.hours}j ${c.minutes}m`)
+      return
+    }
+    throw new Error("presensi timer on|off|<jam> <menit>")
+  }
+  const go = a === "go"
+  if (a && a !== "go") throw new Error("presensi | presensi on|off | presensi timer … | presensi go")
+  const cookie = loadCookie()
+  const { cfg, hits } = await scanPresensi(cookie, COOKIE_FILE)
+  console.log(textPresensiScan(cfg, hits))
+  if (!go) return
+  if (!cfg.enabled) {
+    console.log("toggle off — tidak POST")
+    return
+  }
+  const ready = hits.filter((h) => h.ready)
+  if (!ready.length) {
+    console.log("tidak ada yang siap POST")
+    return
+  }
+  for (const h of ready) {
+    const r = await post("/presensi/mahasiswa", h.payload, cookie, COOKIE_FILE) as { sukses?: boolean; pesan?: string }
+    console.log(h.nama, r?.sukses ? "ok" : "gagal", r?.pesan ?? JSON.stringify(r))
+  }
+}
+
 function selfCheck() {
   const u = apiUrl("/kuliah", { tahun: "2026", semester: "1" })
   if (u !== "https://ethol.pens.ac.id/api/kuliah?tahun=2026&semester=1") throw new Error(`url join: ${u}`)
   try {
-    assertGettable("/presensi/mahasiswa")
+    assertGettable("/notifikasi/mahasiswa-baca-notif")
     throw new Error("write not blocked")
   } catch (e) {
     if (!(e instanceof Error) || !e.message.startsWith("blocked write")) throw e
   }
+  try {
+    assertPostable("/presensi/buka")
+    throw new Error("dosen write not blocked")
+  } catch (e) {
+    if (!(e instanceof Error) || !e.message.startsWith("blocked write")) throw e
+  }
+  assertPostable("/presensi/mahasiswa")
+  const wait = delayMs({ enabled: false, timer: true, hours: 1, minutes: 15, seen: {} })
+  if (wait !== 75 * 60 * 1000) throw new Error(`delay ${wait}`)
   console.log("ok")
 }
 
@@ -214,7 +455,7 @@ body{font:16px/1.4 system-ui;max-width:42rem;margin:2rem auto;padding:0 1rem;bac
 }
 
 const menuKb = {
-  keyboard: [[{ text: "Tugas" }, { text: "Materi" }]],
+  keyboard: [[{ text: "Tugas" }, { text: "Materi" }], [{ text: "Jadwal" }]],
   resize_keyboard: true,
 }
 
@@ -265,7 +506,7 @@ async function handleMsg(token: string, chat: string, text: string) {
   const cookie = cookieFor(chat)
   const file = cookie && chat === env("TELEGRAM_CHAT_ID") ? COOKIE_FILE : sessionFile(chat)
   if (t === "/start" || t === "/menu") {
-    await send(token, chat, cookie ? "Menu: Tugas atau Materi." : LOGIN_HELP, { reply_markup: menuKb })
+    await send(token, chat, cookie ? "Menu: Tugas, Materi, Jadwal." : LOGIN_HELP, { reply_markup: menuKb })
     return
   }
   if (t === "/login") {
@@ -288,6 +529,11 @@ async function handleMsg(token: string, chat: string, text: string) {
       callback_data: `m:${c.nomor}:${c.jenisSchema}`,
     }])
     await send(token, chat, "Pilih matakuliah:", { reply_markup: { inline_keyboard: buttons } })
+    return
+  }
+  if (t === "/jadwal" || t === "Jadwal") {
+    await send(token, chat, "Ambil jadwal…")
+    await send(token, chat, await textJadwal(cookie, file))
   }
 }
 
@@ -297,6 +543,7 @@ async function telegramInbox(token: string) {
     commands: [
       { command: "tugas", description: "Tugas belum dikumpulkan" },
       { command: "materi", description: "Materi (pilih matkul + link)" },
+      { command: "jadwal", description: "Jadwal seminggu" },
       { command: "login", description: "Status akun ETHOL" },
       { command: "menu", description: "Menu" },
     ],
@@ -370,8 +617,17 @@ function serve() {
 const [cmd, ...rest] = process.argv.slice(2)
 if (cmd === "--self-check") selfCheck()
 else if (cmd === "serve") serve()
-else if (!cmd || cmd === "-h") {
-  console.log(`node --experimental-strip-types ethol.ts serve`)
+else if (cmd === "presensi") {
+  cmdPresensi(rest).catch((e) => {
+    console.error(e instanceof Error ? e.message : e)
+    process.exit(1)
+  })
+} else if (!cmd || cmd === "-h") {
+  console.log(`node --experimental-strip-types ethol.ts serve
+node --experimental-strip-types ethol.ts presensi
+node --experimental-strip-types ethol.ts presensi on|off
+node --experimental-strip-types ethol.ts presensi timer on|off|<jam> <menit>
+node --experimental-strip-types ethol.ts presensi go`)
 } else {
   get(cmd, parseParams(rest)).then((d) => console.log(JSON.stringify(d, null, 2)), (e) => {
     console.error(e.message)
