@@ -770,13 +770,16 @@ async function finishVnc(token: string, chat: string) {
     await send(token, chat, "Ini sesi login orang lain. Tunggu selesai, lalu /login.")
     return
   }
-  const r = await fetch("http://127.0.0.1:9876/dump")
-  if (!r.ok) throw new Error("dump cookie gagal")
-  const cookies = await r.json() as { name: string; value: string; domain?: string }[]
+  let cookies: { name: string; value: string }[] = []
+  try {
+    const r = await fetch("http://127.0.0.1:9876/dump")
+    if (r.ok) cookies = await r.json() as { name: string; value: string }[]
+  } catch { /* dump dead */ }
   const tokenC = cookies.find((c) => c.name === "token")
   const refreshC = cookies.find((c) => c.name === "refresh_token")
   if (!tokenC?.value || !refreshC?.value) {
-    await send(token, chat, "Belum ketemu session. Login dulu di halaman ETHOL, baru Done.", { reply_markup: loginKb() })
+    stopLoginProcs()
+    await send(token, chat, "Login batal — belum ada session ETHOL. Browser dimatikan.")
     return
   }
   const file = cookieFileFor(chat)

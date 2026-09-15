@@ -23,7 +23,8 @@ Kalau belum / mati:
 2. Link `https://login.ardeen.fun/v/<kunci>/…` + **Done**
 3. Login CAS **akun sendiri**
 4. Done → cookie ke file chat itu
-5. Timeout 12 menit
+5. Done tanpa login CAS → sesi dimatikan (error), antrian bebas
+6. Timeout 12 menit
 
 ## Tugas / Materi / Jadwal
 
