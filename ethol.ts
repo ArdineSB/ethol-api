@@ -845,6 +845,13 @@ async function handleMsg(token: string, chat: string, text: string) {
     await openVnc(token, chat)
     return
   }
+  if (t === "/logout") {
+    const live = loadLogin()
+    if (live?.chat === chat) stopLoginProcs()
+    try { unlinkSync(cookieFileFor(chat)) } catch { /* none */ }
+    await send(token, chat, "Session ETHOL dihapus. /login lagi kalau perlu.")
+    return
+  }
   if (!cookie) {
     await send(token, chat, LOGIN_HELP)
     return
@@ -952,7 +959,8 @@ async function telegramInbox(token: string) {
       { command: "materi", description: "Materi (pilih matkul + link)" },
       { command: "jadwal", description: "Jadwal seminggu" },
       { command: "presensi", description: "Auto-presensi (toggle + timer)" },
-      { command: "login", description: "Status akun ETHOL" },
+      { command: "login", description: "Hubungkan ETHOL" },
+      { command: "logout", description: "Hapus session ETHOL" },
       { command: "menu", description: "Menu" },
     ],
   })

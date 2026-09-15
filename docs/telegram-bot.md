@@ -2,7 +2,7 @@
 
 Satu bot, satu proses `ethol.ts serve`. Bukan bot per orang.
 
-Perintah: `/menu` `/tugas` `/materi` `/jadwal` `/presensi` `/login`
+Perintah: `/menu` `/tugas` `/materi` `/jadwal` `/presensi` `/login` `/logout`
 
 Keyboard: **Tugas** · **Materi** · **Jadwal** · **Presensi**
 
@@ -25,6 +25,8 @@ Kalau belum / mati:
 4. Done → cookie ke file chat itu
 5. Done tanpa login CAS → sesi dimatikan (error), antrian bebas
 6. Timeout 12 menit
+
+`/logout` hapus cookie chat itu (bukan punya orang lain). Kalau VNC login miliknya masih nyala, ikut dimatikan. Presensi config tidak dihapus.
 
 ## Tugas / Materi / Jadwal
 
