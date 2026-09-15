@@ -72,6 +72,14 @@ function sessionFile(chat: string) {
   return join(SESS_DIR, `${chat}.cookie`)
 }
 
+function isOwner(chat: string) {
+  return chat === env("TELEGRAM_CHAT_ID")
+}
+
+function cookieFileFor(chat: string) {
+  return isOwner(chat) ? COOKIE_FILE : sessionFile(chat)
+}
+
 function cookieFor(chat: string): string | null {
   try {
     const s = readFileSync(sessionFile(chat), "utf8").trim()
@@ -532,6 +540,9 @@ function selfCheck() {
   const u2 = untilMs(2026, 9, 16, 22, 0)
   if (!u2 || !fmtWib(u2).includes("2026") || !fmtWib(u2).includes("WIB")) throw new Error("until wib")
   if (parseTanggal("16-09-2026")?.d !== 16) throw new Error("tgl")
+  const own = env("TELEGRAM_CHAT_ID")
+  if (own && cookieFileFor(own) !== COOKIE_FILE) throw new Error("owner file")
+  if (cookieFileFor("999") !== sessionFile("999")) throw new Error("friend file")
   console.log("ok")
 }
 
@@ -629,9 +640,10 @@ async function telegramTick(token: string, chat: string) {
 
 const LOGIN_HELP = `Akun ETHOL per Telegram, bukan share satu session.
 
-Owner: /login buka browser ETHOL di HP/PC. Teman: jangan kirim password ke bot.`
+Ketik /login — buka link, login ETHOL akun kamu, lalu Done.
+Jangan kirim password ke chat.`
 
-type LoginRun = { secret: string; pids: number[]; started: number }
+type LoginRun = { secret: string; pids: number[]; started: number; chat: string }
 let loginTimer: ReturnType<typeof setTimeout> | undefined
 let loginNotify: { token: string; chat: string } | undefined
 
@@ -712,12 +724,17 @@ async function waitDump(ms = 25000) {
 }
 
 async function openVnc(token: string, chat: string) {
+  mkdirSync(SESS_DIR, { recursive: true })
   const live = loadLogin()
   if (live) {
     try {
       const r = await fetch("http://127.0.0.1:9876/dump")
       if (r.ok) {
-        await send(token, chat, `Masih nyala. Login ETHOL di link ini, lalu Done.\n${vncUrl(live.secret)}`, { reply_markup: loginKb() })
+        if (live.chat === chat) {
+          await send(token, chat, `Masih nyala. Login ETHOL di link ini, lalu Done.\n${vncUrl(live.secret)}`, { reply_markup: loginKb() })
+        } else {
+          await send(token, chat, "Sesi login sedang dipakai orang lain. Tunggu Done/timeout, lalu /login lagi.")
+        }
         return
       }
     } catch { /* restart */ }
@@ -731,7 +748,7 @@ async function openVnc(token: string, chat: string) {
   pids.push(spawnBg("x11vnc", ["-display", ":99", "-localhost", "-nopw", "-forever", "-shared", "-rfbport", "5900", "-q"]))
   pids.push(spawnBg("websockify", ["--web", "/usr/share/novnc", "127.0.0.1:6080", "127.0.0.1:5900"]))
   pids.push(spawnBg("node", [join(DIR, "login-session.mjs")], { DISPLAY: ":99" }))
-  writeFileSync(LOGIN_FILE, JSON.stringify({ secret, pids, started: Date.now() }))
+  writeFileSync(LOGIN_FILE, JSON.stringify({ secret, pids, started: Date.now(), chat }))
   writeVncNginx(secret)
   loginNotify = { token, chat }
   if (loginTimer) clearTimeout(loginTimer)
@@ -740,13 +757,17 @@ async function openVnc(token: string, chat: string) {
     send(token, chat, "Login timeout (12 menit). Browser dimatikan. /login lagi kalau perlu.").catch(() => {})
   }, 12 * 60 * 1000)
   await waitDump()
-  await send(token, chat, `Buka, login ETHOL, lalu pencet Done.\n${vncUrl(secret)}`, { reply_markup: loginKb() })
+  await send(token, chat, `Buka, login ETHOL akun kamu, lalu pencet Done.\n${vncUrl(secret)}`, { reply_markup: loginKb() })
 }
 
 async function finishVnc(token: string, chat: string) {
   const run = loadLogin()
   if (!run) {
     await send(token, chat, "Tidak ada sesi login. Ketik /login.")
+    return
+  }
+  if (run.chat && run.chat !== chat) {
+    await send(token, chat, "Ini sesi login orang lain. Tunggu selesai, lalu /login.")
     return
   }
   const r = await fetch("http://127.0.0.1:9876/dump")
@@ -758,9 +779,11 @@ async function finishVnc(token: string, chat: string) {
     await send(token, chat, "Belum ketemu session. Login dulu di halaman ETHOL, baru Done.", { reply_markup: loginKb() })
     return
   }
-  writeCookie(COOKIE_FILE, `refresh_token=${refreshC.value}; token=${tokenC.value}`)
+  const file = cookieFileFor(chat)
+  mkdirSync(SESS_DIR, { recursive: true })
+  writeCookie(file, `refresh_token=${refreshC.value}; token=${tokenC.value}`)
   stopLoginProcs()
-  const me = (await get("/auth/validasi-token", {}, loadCookie(), COOKIE_FILE)) as Me
+  const me = (await get("/auth/validasi-token", {}, readFileSync(file, "utf8").trim(), file)) as Me
   await send(token, chat, `Terhubung: ${me.nama ?? "ok"}`)
 }
 
@@ -801,22 +824,22 @@ async function handleMsg(token: string, chat: string, text: string) {
   const cookie = cookieFor(chat)
   const file = cookie && chat === env("TELEGRAM_CHAT_ID") ? COOKIE_FILE : sessionFile(chat)
   if (t === "/start" || t === "/menu") {
-    await send(token, chat, cookie ? "Menu: Tugas, Materi, Jadwal, Presensi." : LOGIN_HELP, { reply_markup: menuKb })
+    await send(token, chat, cookie ? "Menu: Tugas, Materi, Jadwal." : "Ketik /login buat hubungkan ETHOL (akun kamu sendiri).", { reply_markup: menuKb })
     return
   }
   if (t === "/login") {
-    if (chat !== env("TELEGRAM_CHAT_ID")) {
-      await send(token, chat, LOGIN_HELP)
-      return
+    const file = cookieFileFor(chat)
+    const ck = cookieFor(chat)
+    if (ck) {
+      try {
+        const me = (await get("/auth/validasi-token", {}, ck, file)) as Me
+        await send(token, chat, `Terhubung: ${me.nama ?? "ok"}`, {
+          reply_markup: { inline_keyboard: [[{ text: "Login ulang", callback_data: "p:vnc" }]] },
+        })
+        return
+      } catch { /* recapture */ }
     }
-    try {
-      const me = (await get("/auth/validasi-token", {}, cookie ?? loadCookie(), file ?? COOKIE_FILE)) as Me
-      await send(token, chat, `Terhubung: ${me.nama ?? "ok"}`, {
-        reply_markup: { inline_keyboard: [[{ text: "Login ulang", callback_data: "p:vnc" }]] },
-      })
-    } catch {
-      await openVnc(token, chat)
-    }
+    await openVnc(token, chat)
     return
   }
   if (!cookie) {
@@ -952,10 +975,6 @@ async function telegramInbox(token: string) {
           try {
             await tg(token, "answerCallbackQuery", { callback_query_id: cb.id })
             if (cb.data === "p:vnc" || cb.data === "p:done") {
-              if (chat !== env("TELEGRAM_CHAT_ID")) {
-                await send(token, chat, "Cuma owner.")
-                continue
-              }
               if (cb.data === "p:vnc") await openVnc(token, chat)
               else await finishVnc(token, chat)
               continue

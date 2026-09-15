@@ -8,23 +8,22 @@ Keyboard: **Tugas** · **Materi** · **Jadwal** · **Presensi**
 
 ## Akun
 
-- Owner chat (`TELEGRAM_CHAT_ID` di `.env`) memakai `.cookie`
-- Teman: `sessions/<chat_id>.cookie` (jangan kirim password ke bot)
-- `/login` cek `GET /auth/validasi-token`. File cookie ada ≠ session hidup
+- Owner (`TELEGRAM_CHAT_ID`) → `.cookie`
+- Temen → `sessions/<chat_id>.cookie` lewat `/login` sendiri
+- Satu VNC dalam satu waktu. Chat lain: “sedang dipakai orang lain”
+- Jangan kirim password / share cookie
 
-## /login (owner)
+## /login (semua)
 
-Kalau session hidup: `Terhubung: <nama>` + tombol **Login ulang**.
+Kalau session hidup: `Terhubung: <nama>` + **Login ulang**.
 
-Kalau mati (atau Login ulang):
+Kalau belum / mati:
 
-1. VPS nyalain Xvfb + Chromium (ETHOL sudah kebuka) + noVNC
-2. Bot kirim link `https://login.ardeen.fun/v/<kunci>/…` + tombol **Done**
-3. Buka di HP/PC, login CAS di halaman ETHOL asli
-4. Pencet **Done** → cookie HttpOnly diambil, browser dimatikan
+1. Browser ETHOL di VPS + noVNC
+2. Link `https://login.ardeen.fun/v/<kunci>/…` + **Done**
+3. Login CAS **akun sendiri**
+4. Done → cookie ke file chat itu
 5. Timeout 12 menit
-
-Jangan pakai link lama setelah bot restart. Password CAS tidak disimpan.
 
 ## Tugas / Materi / Jadwal
 
