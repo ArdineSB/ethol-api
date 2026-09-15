@@ -1,4 +1,8 @@
 .cookie
 .env
 .seen.json
+.presensi.json
+.ethol.log
+.login.json
+node_modules/
 sessions/

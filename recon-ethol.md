@@ -12,7 +12,7 @@ Source: logged-in UI `https://ethol.pens.ac.id/` + public SPA bundle
 SPA React. Axios `baseURL` `https://ethol.pens.ac.id/api`, `withCredentials: true`.
 No websocket / FCM. Poll REST.
 
-Do **not** store passwords. Do **not** call write endpoints below from ethol-api.
+Do **not** store passwords. Mark-read / tugas submit / dosen buka-tutup-batal: jangan. Auto-presensi mahasiswa: `POST /presensi/mahasiswa` saat `open === 1`.
 
 ## Auth
 
@@ -94,12 +94,27 @@ Read (ethol-api **may**):
 
 UI: `aktifKuliah` rows with `open === 1` enable the Presensi button; otherwise it stays disabled. `key` on an open session is used by other official calls.
 
-Write (**do not call** from ethol-api / manager / telegram):
+Write (bundle `index-Bcg_2nim.js`, 2026-09-05 — **not live-POSTed**):
 
-| Action | Method | Path |
-|---|---|---|
-| Mahasiswa klik Presensi | POST | `/presensi/mahasiswa` |
-| Dosen buka/tutup/batal | POST `/presensi/buka`, PUT `/presensi/tutup`, PUT `/presensi/batalkan` |
+`mahasiswaPresensi: e => POST /presensi/mahasiswa` body:
+
+```
+{ kuliah, jenis_schema, mahasiswa, key, kuliah_asal }
+```
+
+- `kuliah` + `jenis_schema`: id matakuliah halaman itu
+- `mahasiswa`: `user.nomor` di session
+- `key`: row `aktifKuliah` yang `open === 1`
+- `kuliah_asal`: dari detail kuliah, atau `null`
+- sudah hadir: riwayat punya `key` yang sama → tombol resmi tidak nge-POST lagi
+- sukses: `{ sukses, pesan }`
+
+Kuliah page: `key: sesi.key`. Ujian page: `key` langsung (beda shape). Auto-presensi kuliah pakai yang pertama.
+
+| Action | Method | Path | ethol-api |
+|---|---|---|---|
+| Mahasiswa klik Presensi | POST | `/presensi/mahasiswa` | boleh saat `open === 1` + body di atas |
+| Dosen buka/tutup/batal | POST / PUT | `/presensi/buka`, `/presensi/tutup`, `/presensi/batalkan` | jangan |
 
 ## Notifikasi (lonceng)
 
@@ -123,4 +138,4 @@ Clicking a row in the official UI marks it read. Capture must not.
 
 ## Not for ethol-api
 
-Kuis/ujian submit, forum write, video/materi upload, any presensi POST/PUT, tugas submit, mark-read.
+Kuis/ujian submit, forum write, video/materi upload, dosen presensi buka/tutup/batal, tugas submit, mark-read.

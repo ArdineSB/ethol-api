@@ -3,5 +3,8 @@
   "scripts": {
     "serve": "node --experimental-strip-types ethol.ts serve",
     "ethol": "node --experimental-strip-types ethol.ts"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
   }
 }

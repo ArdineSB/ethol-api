@@ -1,4 +1,6 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { spawn } from "node:child_process"
+import { randomBytes } from "node:crypto"
 import { createServer } from "node:http"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -8,6 +10,8 @@ const DIR = dirname(fileURLToPath(import.meta.url))
 const COOKIE_FILE = join(DIR, ".cookie")
 const SEEN_FILE = join(DIR, ".seen.json")
 const PRE_FILE = join(DIR, ".presensi.json")
+const LOG_FILE = join(DIR, ".ethol.log")
+const LOGIN_FILE = join(DIR, ".login.json")
 const SESS_DIR = join(DIR, "sessions")
 const PORT = 8787
 const TG = "https://api.telegram.org/bot"
@@ -162,13 +166,25 @@ type Slot = {
 type Me = { nomor: number; nama?: string }
 type Sesi = { open?: number; key: string }
 type Riwayat = { key: string }
-type PresensiCfg = { enabled: boolean; timer: boolean; hours: number; minutes: number; seen: Record<string, number> }
+type PresensiCfg = {
+  enabled: boolean
+  timer: boolean
+  until: number
+  hours: number
+  minutes: number
+  ask: "" | "tanggal" | "jam" | "menit"
+  askY: number
+  askM: number
+  askD: number
+  seen: Record<string, number>
+}
 type PresensiHit = {
   nama: string
   kuliah: number
   jenis_schema: number
   key: string
   already: boolean
+  fresh: boolean
   payload: { kuliah: number; jenis_schema: number; mahasiswa: number; key: string; kuliah_asal: number | null }
   firstSeen: number
   ready: boolean
@@ -267,17 +283,23 @@ async function textJadwal(cookie: string, file: string): Promise<string> {
 }
 
 function defaultCfg(): PresensiCfg {
-  return { enabled: false, timer: false, hours: 0, minutes: 0, seen: {} }
+  return { enabled: false, timer: false, until: 0, hours: 0, minutes: 0, ask: "", askY: 0, askM: 0, askD: 0, seen: {} }
 }
 
 function loadCfg(): PresensiCfg {
   try {
     const j = JSON.parse(readFileSync(PRE_FILE, "utf8")) as Partial<PresensiCfg>
+    const ask = j.ask === "tanggal" || j.ask === "jam" || j.ask === "menit" ? j.ask : ""
     return {
       enabled: !!j.enabled,
       timer: !!j.timer,
+      until: Number.isFinite(j.until) && (j.until as number) > 0 ? Math.floor(j.until as number) : 0,
       hours: Number.isFinite(j.hours) && (j.hours as number) >= 0 ? Math.floor(j.hours as number) : 0,
       minutes: Number.isFinite(j.minutes) && (j.minutes as number) >= 0 ? Math.floor(j.minutes as number) : 0,
+      ask,
+      askY: Number.isFinite(j.askY) ? Math.floor(j.askY as number) : 0,
+      askM: Number.isFinite(j.askM) ? Math.floor(j.askM as number) : 0,
+      askD: Number.isFinite(j.askD) ? Math.floor(j.askD as number) : 0,
       seen: j.seen && typeof j.seen === "object" ? j.seen : {},
     }
   } catch {
@@ -291,6 +313,30 @@ function saveCfg(c: PresensiCfg) {
 
 function delayMs(c: PresensiCfg) {
   return (c.hours * 60 + c.minutes) * 60 * 1000
+}
+
+function untilMs(y: number, m: number, d: number, hh: number, mm: number) {
+  const pad = (n: number) => String(n).padStart(2, "0")
+  const t = Date.parse(`${y}-${pad(m)}-${pad(d)}T${pad(hh)}:${pad(mm)}:00+07:00`)
+  return Number.isFinite(t) ? t : 0
+}
+
+function parseTanggal(s: string): { y: number; m: number; d: number } | null {
+  const a = /^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})$/.exec(s.trim())
+  if (a) return { d: +a[1], m: +a[2], y: +a[3] }
+  const b = /^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})$/.exec(s.trim())
+  if (b) return { y: +b[1], m: +b[2], d: +b[3] }
+  return null
+}
+
+function timerExpired(cfg: PresensiCfg, now = Date.now()) {
+  return cfg.timer && cfg.until > 0 && now >= cfg.until
+}
+
+function timerActive(cfg: PresensiCfg, now = Date.now()) {
+  if (!cfg.timer) return true
+  if (!cfg.until) return false
+  return now < cfg.until
 }
 
 function seenKey(kuliah: number, js: number, key: string) {
@@ -311,17 +357,19 @@ async function scanPresensi(cookie: string, file: string, now = Date.now()): Pro
     if (!open?.key) continue
     const sk = seenKey(c.nomor, js, open.key)
     live.add(sk)
+    const fresh = cfg.seen[sk] == null
     const riwayat = (await get("/presensi/riwayat", { kuliah: String(c.nomor), jenis_schema: String(js), nomor: String(me.nomor) }, cookie, file)) as Riwayat[]
     const already = (riwayat ?? []).some((r) => r.key === open.key)
     const firstSeen = cfg.seen[sk] ?? now
     cfg.seen[sk] = firstSeen
-    const wait = cfg.timer ? Math.max(0, firstSeen + delayMs(cfg) - now) : 0
+    const wait = 0
     hits.push({
       nama: c.matakuliah.nama,
       kuliah: c.nomor,
       jenis_schema: js,
       key: open.key,
       already,
+      fresh,
       payload: {
         kuliah: c.nomor,
         jenis_schema: js,
@@ -330,13 +378,27 @@ async function scanPresensi(cookie: string, file: string, now = Date.now()): Pro
         kuliah_asal: c.kuliah_asal ?? null,
       },
       firstSeen,
-      ready: !already && wait === 0,
+      ready: !already && timerActive(cfg, now),
       waitMs: wait,
     })
   }
   cfg.seen = Object.fromEntries(Object.entries(cfg.seen).filter(([k]) => live.has(k)))
   saveCfg(cfg)
   return { cfg, hits }
+}
+
+function fmtWib(ts: number) {
+  const s = new Date(ts).toLocaleString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+  return `${s} WIB`
 }
 
 function fmtWait(ms: number) {
@@ -346,16 +408,56 @@ function fmtWait(ms: number) {
   return h ? `${h}j ${m}m` : `${m}m`
 }
 
-function textPresensiScan(cfg: PresensiCfg, hits: PresensiHit[]) {
-  const head = `toggle ${cfg.enabled ? "on" : "off"} · timer ${cfg.timer ? "on" : "off"} ${cfg.hours}j ${cfg.minutes}m`
+function textPresensiScan(cfg: PresensiCfg, hits: PresensiHit[], dump = false) {
+  const now = Date.now()
+  let timerLine = "Timer: OFF (tanpa batas, absen pas dosen buka)"
+  if (cfg.timer && !cfg.until) timerLine = "Timer: ON · tanggal/jam batas belum diisi"
+  else if (cfg.timer && timerExpired(cfg, now)) timerLine = `Timer: HABIS sejak ${fmtWib(cfg.until)} — auto absen berhenti`
+  else if (cfg.timer) timerLine = `Timer: ON sampai ${fmtWib(cfg.until)}`
+  const head = `Auto: ${cfg.enabled ? "ON" : "OFF"}\n${timerLine}`
   if (!hits.length) return `${head}\nTidak ada presensi terbuka.`
   const lines = [head, ""]
   for (const h of hits) {
-    const st = h.already ? "sudah hadir" : h.ready ? "siap POST" : `tunggu ${fmtWait(h.waitMs)}`
+    const st = h.already ? "sudah hadir" : h.ready ? "siap absen sekarang" : "timer habis, tidak auto absen"
     lines.push(`${h.nama} · ${st}`)
-    lines.push(`  ${JSON.stringify(h.payload)}`)
+    if (dump) lines.push(`  ${JSON.stringify(h.payload)}`)
   }
   return lines.join("\n")
+}
+
+function presensiInline(c: PresensiCfg) {
+  return {
+    inline_keyboard: [[
+      { text: `Auto: ${c.enabled ? "ON" : "OFF"}`, callback_data: "p:auto" },
+      { text: `Timer: ${c.timer ? "ON" : "OFF"}`, callback_data: "p:timer" },
+    ]],
+  }
+}
+
+async function postReady(cookie: string, file: string, hits: PresensiHit[]): Promise<string[]> {
+  const out: string[] = []
+  for (const h of hits.filter((x) => x.ready)) {
+    const r = await post("/presensi/mahasiswa", h.payload, cookie, file) as { sukses?: boolean; pesan?: string }
+    const ok = !!r?.sukses
+    out.push(ok
+      ? `Presensi otomatis tercatat\n${h.nama}\n${r?.pesan ?? "hadir"}\n${fmtWib(Date.now())}`
+      : `Presensi otomatis gagal\n${h.nama}\n${r?.pesan ?? "gagal"}`)
+  }
+  return out
+}
+
+async function tickPresensi(cookie: string, file: string): Promise<string[]> {
+  const cfg = loadCfg()
+  if (!cfg.enabled) return []
+  const { hits } = await scanPresensi(cookie, file)
+  const notes = await postReady(cookie, file, hits)
+  for (const h of hits) {
+    if (!h.already && h.fresh) {
+      if (h.ready) notes.push(`Presensi buka: ${h.nama}\nAuto absen sekarang${cfg.until ? `\nBatas ${fmtWib(cfg.until)}` : ""}`)
+      else notes.push(`Presensi buka: ${h.nama}\nTimer sudah habis, tidak auto absen`)
+    }
+  }
+  return notes
 }
 
 async function cmdPresensi(args: string[]) {
@@ -376,40 +478,37 @@ async function cmdPresensi(args: string[]) {
       console.log(`timer ${c.timer ? "on" : "off"} ${c.hours}j ${c.minutes}m`)
       return
     }
-    if (args.length >= 3) {
-      const hours = Number(args[1])
-      const minutes = Number(args[2])
-      if (!Number.isInteger(hours) || hours < 0 || !Number.isInteger(minutes) || minutes < 0) {
-        throw new Error("timer jam menit = angka ≥ 0")
+    if (args.length >= 4) {
+      const tgl = parseTanggal(args[1])
+      const hours = Number(args[2])
+      const minutes = Number(args[3])
+      if (!tgl || !Number.isInteger(hours) || hours < 0 || hours > 23 || !Number.isInteger(minutes) || minutes < 0 || minutes > 59) {
+        throw new Error("presensi timer DD-MM-YYYY jam menit")
       }
+      const until = untilMs(tgl.y, tgl.m, tgl.d, hours, minutes)
+      if (!until) throw new Error("tanggal/jam tidak valid")
       c.timer = true
       c.hours = hours
       c.minutes = minutes
+      c.until = until
       saveCfg(c)
-      console.log(`timer on ${c.hours}j ${c.minutes}m`)
+      console.log(`timer on sampai ${fmtWib(until)}`)
       return
     }
-    throw new Error("presensi timer on|off|<jam> <menit>")
+    throw new Error("presensi timer on|off|DD-MM-YYYY jam menit")
   }
   const go = a === "go"
   if (a && a !== "go") throw new Error("presensi | presensi on|off | presensi timer … | presensi go")
   const cookie = loadCookie()
   const { cfg, hits } = await scanPresensi(cookie, COOKIE_FILE)
-  console.log(textPresensiScan(cfg, hits))
+  console.log(textPresensiScan(cfg, hits, true))
   if (!go) return
   if (!cfg.enabled) {
     console.log("toggle off — tidak POST")
     return
   }
-  const ready = hits.filter((h) => h.ready)
-  if (!ready.length) {
-    console.log("tidak ada yang siap POST")
-    return
-  }
-  for (const h of ready) {
-    const r = await post("/presensi/mahasiswa", h.payload, cookie, COOKIE_FILE) as { sukses?: boolean; pesan?: string }
-    console.log(h.nama, r?.sukses ? "ok" : "gagal", r?.pesan ?? JSON.stringify(r))
-  }
+  const posted = await postReady(cookie, COOKIE_FILE, hits)
+  console.log(posted.length ? posted.join("\n") : "tidak ada yang siap POST")
 }
 
 function selfCheck() {
@@ -428,8 +527,11 @@ function selfCheck() {
     if (!(e instanceof Error) || !e.message.startsWith("blocked write")) throw e
   }
   assertPostable("/presensi/mahasiswa")
-  const wait = delayMs({ enabled: false, timer: true, hours: 1, minutes: 15, seen: {} })
+  const wait = delayMs({ enabled: false, timer: true, until: 0, hours: 1, minutes: 15, ask: "", askY: 0, askM: 0, askD: 0, seen: {} })
   if (wait !== 75 * 60 * 1000) throw new Error(`delay ${wait}`)
+  const u2 = untilMs(2026, 9, 16, 22, 0)
+  if (!u2 || !fmtWib(u2).includes("2026") || !fmtWib(u2).includes("WIB")) throw new Error("until wib")
+  if (parseTanggal("16-09-2026")?.d !== 16) throw new Error("tgl")
   console.log("ok")
 }
 
@@ -455,7 +557,7 @@ body{font:16px/1.4 system-ui;max-width:42rem;margin:2rem auto;padding:0 1rem;bac
 }
 
 const menuKb = {
-  keyboard: [[{ text: "Tugas" }, { text: "Materi" }], [{ text: "Jadwal" }]],
+  keyboard: [[{ text: "Tugas" }, { text: "Materi" }], [{ text: "Jadwal" }, { text: "Presensi" }]],
   resize_keyboard: true,
 }
 
@@ -472,68 +574,347 @@ async function send(token: string, chat: string, text: string, extra: Record<str
   await tg(token, "sendMessage", { chat_id: chat, text, disable_web_page_preview: false, ...extra })
 }
 
+function logLine(msg: string) {
+  const line = `${new Date().toISOString()} ${msg}`
+  console.error(line)
+  try { appendFileSync(LOG_FILE, line + "\n") } catch { /* disk */ }
+}
+
+function friendlyErr(e: unknown) {
+  const msg = e instanceof Error ? e.message : String(e)
+  if (/refresh failed|401/.test(msg)) return `Session ETHOL mati (${msg}). Buka ethol.pens.ac.id di Zen, session perlu di-capture lagi.`
+  return `Error: ${msg}`
+}
+
+let lastReport = ""
+let lastReportAt = 0
+async function report(token: string, chat: string, e: unknown) {
+  const msg = e instanceof Error ? e.message : String(e)
+  logLine(msg)
+  const now = Date.now()
+  if (msg === lastReport && now - lastReportAt < 15 * 60 * 1000) return
+  lastReport = msg
+  lastReportAt = now
+  try { await send(token, chat, friendlyErr(e)) } catch (se) {
+    logLine(`tg report failed: ${se instanceof Error ? se.message : se}`)
+  }
+}
+
 async function telegramTick(token: string, chat: string) {
-  const cookie = cookieFor(chat)
-  if (!cookie) return
-  const file = chat === env("TELEGRAM_CHAT_ID") ? COOKIE_FILE : sessionFile(chat)
-  const { notifications } = await data(cookie, file)
-  let seen: number[] = []
   try {
-    seen = JSON.parse(readFileSync(SEEN_FILE, "utf8"))
-  } catch { /* first run */ }
-  const ids = notifications.map((n) => n.idNotifikasi)
-  if (seen.length === 0) {
-    writeFileSync(SEEN_FILE, JSON.stringify(ids))
-    console.log("telegram: seeded", ids.length)
-    return
+    const cookie = cookieFor(chat)
+    if (!cookie) return
+    const file = chat === env("TELEGRAM_CHAT_ID") ? COOKIE_FILE : sessionFile(chat)
+    const { notifications } = await data(cookie, file)
+    let seen: number[] = []
+    try {
+      seen = JSON.parse(readFileSync(SEEN_FILE, "utf8"))
+    } catch { /* first run */ }
+    const ids = notifications.map((n) => n.idNotifikasi)
+    if (seen.length === 0) {
+      writeFileSync(SEEN_FILE, JSON.stringify(ids))
+      console.log("telegram: seeded", ids.length)
+    } else {
+      const have = new Set(seen)
+      for (const n of notifications.filter((x) => !have.has(x.idNotifikasi))) {
+        await send(token, chat, [n.kodeNotifikasi, n.keterangan, n.waktuNotifikasi].filter(Boolean).join("\n") || String(n.idNotifikasi))
+      }
+      writeFileSync(SEEN_FILE, JSON.stringify([...new Set([...ids, ...seen])].slice(0, 500)))
+    }
+    for (const n of await tickPresensi(cookie, file)) await send(token, chat, n)
+  } catch (e) {
+    await report(token, chat, e)
   }
-  const have = new Set(seen)
-  for (const n of notifications.filter((x) => !have.has(x.idNotifikasi))) {
-    await send(token, chat, [n.kodeNotifikasi, n.keterangan, n.waktuNotifikasi].filter(Boolean).join("\n") || String(n.idNotifikasi))
-  }
-  writeFileSync(SEEN_FILE, JSON.stringify([...new Set([...ids, ...seen])].slice(0, 500)))
 }
 
 const LOGIN_HELP = `Akun ETHOL per Telegram, bukan share satu session.
 
-Kamu (chat yang sudah di-VPS) sudah terhubung.
-Teman: jangan kirim password ke bot. VPS masih HTTP — form login SSO belum dipasang.
+Owner: /login buka browser ETHOL di HP/PC. Teman: jangan kirim password ke bot.`
 
-Nanti: HTTPS + halaman connect. Sementara admin bisa taruh sessions/<chat_id>.cookie di VPS.`
+type LoginRun = { secret: string; pids: number[]; started: number }
+let loginTimer: ReturnType<typeof setTimeout> | undefined
+let loginNotify: { token: string; chat: string } | undefined
+
+function loadLogin(): LoginRun | null {
+  try {
+    return JSON.parse(readFileSync(LOGIN_FILE, "utf8")) as LoginRun
+  } catch {
+    return null
+  }
+}
+
+function killPid(pid: number) {
+  try { process.kill(pid, "TERM") } catch { /* gone */ }
+}
+
+function writeVncNginx(secret: string | null) {
+  const p = "/etc/nginx/snippets/ethol-vnc.conf"
+  if (!existsSync("/etc/nginx/snippets")) return
+  const body = secret
+    ? `location /v/${secret}/ {
+    proxy_pass http://127.0.0.1:6080/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+`
+    : "# idle\n"
+  writeFileSync(p, body)
+  spawn("nginx", ["-s", "reload"], { stdio: "ignore" })
+}
+
+function stopLoginProcs() {
+  const run = loadLogin()
+  if (run) for (const pid of run.pids) killPid(pid)
+  try { fetch("http://127.0.0.1:9876/quit").catch(() => {}) } catch { /* */ }
+  try { unlinkSync(LOGIN_FILE) } catch { /* */ }
+  writeVncNginx(null)
+  if (loginTimer) clearTimeout(loginTimer)
+  loginTimer = undefined
+}
+
+async function reapDeadLogin() {
+  try {
+    const r = await fetch("http://127.0.0.1:9876/dump")
+    if (r.ok) return
+  } catch { /* down */ }
+  try { unlinkSync(LOGIN_FILE) } catch { /* */ }
+  writeVncNginx(null)
+}
+
+function spawnBg(cmd: string, args: string[], extra: Record<string, string> = {}) {
+  const p = spawn(cmd, args, { detached: true, stdio: "ignore", env: { ...process.env, ...extra } })
+  p.unref()
+  if (!p.pid) throw new Error(`spawn ${cmd}`)
+  return p.pid
+}
+
+function vncUrl(secret: string) {
+  return `https://login.ardeen.fun/v/${secret}/vnc.html?autoconnect=1&resize=scale&path=v/${secret}/websockify`
+}
+
+function loginKb() {
+  return { inline_keyboard: [[{ text: "Done", callback_data: "p:done" }]] }
+}
+
+async function waitDump(ms = 25000) {
+  const t0 = Date.now()
+  while (Date.now() - t0 < ms) {
+    try {
+      const r = await fetch("http://127.0.0.1:9876/dump")
+      if (r.ok) return
+    } catch { /* not yet */ }
+    await new Promise((r) => setTimeout(r, 400))
+  }
+  throw new Error("browser ETHOL tidak nyala")
+}
+
+async function openVnc(token: string, chat: string) {
+  const live = loadLogin()
+  if (live) {
+    try {
+      const r = await fetch("http://127.0.0.1:9876/dump")
+      if (r.ok) {
+        await send(token, chat, `Masih nyala. Login ETHOL di link ini, lalu Done.\n${vncUrl(live.secret)}`, { reply_markup: loginKb() })
+        return
+      }
+    } catch { /* restart */ }
+    stopLoginProcs()
+  }
+  await send(token, chat, "Nyalain browser login…")
+  const secret = randomBytes(16).toString("hex")
+  const pids: number[] = []
+  pids.push(spawnBg("Xvfb", [":99", "-screen", "0", "1280x800x24", "-ac"]))
+  await new Promise((r) => setTimeout(r, 400))
+  pids.push(spawnBg("x11vnc", ["-display", ":99", "-localhost", "-nopw", "-forever", "-shared", "-rfbport", "5900", "-q"]))
+  pids.push(spawnBg("websockify", ["--web", "/usr/share/novnc", "127.0.0.1:6080", "127.0.0.1:5900"]))
+  pids.push(spawnBg("node", [join(DIR, "login-session.mjs")], { DISPLAY: ":99" }))
+  writeFileSync(LOGIN_FILE, JSON.stringify({ secret, pids, started: Date.now() }))
+  writeVncNginx(secret)
+  loginNotify = { token, chat }
+  if (loginTimer) clearTimeout(loginTimer)
+  loginTimer = setTimeout(() => {
+    stopLoginProcs()
+    send(token, chat, "Login timeout (12 menit). Browser dimatikan. /login lagi kalau perlu.").catch(() => {})
+  }, 12 * 60 * 1000)
+  await waitDump()
+  await send(token, chat, `Buka, login ETHOL, lalu pencet Done.\n${vncUrl(secret)}`, { reply_markup: loginKb() })
+}
+
+async function finishVnc(token: string, chat: string) {
+  const run = loadLogin()
+  if (!run) {
+    await send(token, chat, "Tidak ada sesi login. Ketik /login.")
+    return
+  }
+  const r = await fetch("http://127.0.0.1:9876/dump")
+  if (!r.ok) throw new Error("dump cookie gagal")
+  const cookies = await r.json() as { name: string; value: string; domain?: string }[]
+  const tokenC = cookies.find((c) => c.name === "token")
+  const refreshC = cookies.find((c) => c.name === "refresh_token")
+  if (!tokenC?.value || !refreshC?.value) {
+    await send(token, chat, "Belum ketemu session. Login dulu di halaman ETHOL, baru Done.", { reply_markup: loginKb() })
+    return
+  }
+  writeCookie(COOKIE_FILE, `refresh_token=${refreshC.value}; token=${tokenC.value}`)
+  stopLoginProcs()
+  const me = (await get("/auth/validasi-token", {}, loadCookie(), COOKIE_FILE)) as Me
+  await send(token, chat, `Terhubung: ${me.nama ?? "ok"}`)
+}
+
+async function sendPresensiPanel(token: string, chat: string, cookie: string, file: string) {
+  await send(token, chat, "Cek presensi…")
+  const { cfg, hits } = await scanPresensi(cookie, file)
+  await send(token, chat, textPresensiScan(cfg, hits), { reply_markup: presensiInline(cfg) })
+}
+
+async function handlePresensiCb(token: string, chat: string, cookie: string, file: string, data: string) {
+  const c = loadCfg()
+  if (data === "p:auto") {
+    c.enabled = !c.enabled
+    c.ask = ""
+    saveCfg(c)
+    await send(token, chat, `Auto ${c.enabled ? "ON" : "OFF"}`, { reply_markup: presensiInline(c) })
+    if (c.enabled) {
+      for (const n of await tickPresensi(cookie, file)) await send(token, chat, n)
+    }
+    return
+  }
+  if (data === "p:timer") {
+    c.timer = !c.timer
+    if (c.timer) {
+      c.ask = "tanggal"
+      saveCfg(c)
+      await send(token, chat, "Tanggal batas? (contoh 16-09-2026)", { reply_markup: presensiInline(c) })
+      return
+    }
+    c.ask = ""
+    saveCfg(c)
+    await send(token, chat, "Timer OFF", { reply_markup: presensiInline(c) })
+  }
+}
 
 async function handleMsg(token: string, chat: string, text: string) {
   const t = text.trim()
   const cookie = cookieFor(chat)
   const file = cookie && chat === env("TELEGRAM_CHAT_ID") ? COOKIE_FILE : sessionFile(chat)
   if (t === "/start" || t === "/menu") {
-    await send(token, chat, cookie ? "Menu: Tugas, Materi, Jadwal." : LOGIN_HELP, { reply_markup: menuKb })
+    await send(token, chat, cookie ? "Menu: Tugas, Materi, Jadwal, Presensi." : LOGIN_HELP, { reply_markup: menuKb })
     return
   }
   if (t === "/login") {
-    await send(token, chat, cookie ? "Sudah terhubung." : LOGIN_HELP)
+    if (chat !== env("TELEGRAM_CHAT_ID")) {
+      await send(token, chat, LOGIN_HELP)
+      return
+    }
+    try {
+      const me = (await get("/auth/validasi-token", {}, cookie ?? loadCookie(), file ?? COOKIE_FILE)) as Me
+      await send(token, chat, `Terhubung: ${me.nama ?? "ok"}`, {
+        reply_markup: { inline_keyboard: [[{ text: "Login ulang", callback_data: "p:vnc" }]] },
+      })
+    } catch {
+      await openVnc(token, chat)
+    }
     return
   }
   if (!cookie) {
     await send(token, chat, LOGIN_HELP)
     return
   }
+  const owner = chat === env("TELEGRAM_CHAT_ID")
+  const cfg = loadCfg()
+  if (owner && (cfg.ask === "tanggal" || cfg.ask === "jam" || cfg.ask === "menit") && !t.startsWith("/") && t !== "Tugas" && t !== "Materi" && t !== "Jadwal" && t !== "Presensi") {
+    if (cfg.ask === "tanggal") {
+      const tgl = parseTanggal(t)
+      if (!tgl || tgl.m < 1 || tgl.m > 12 || tgl.d < 1 || tgl.d > 31) {
+        await send(token, chat, "Format tanggal: 16-09-2026")
+        return
+      }
+      cfg.askY = tgl.y
+      cfg.askM = tgl.m
+      cfg.askD = tgl.d
+      cfg.ask = "jam"
+      saveCfg(cfg)
+      await send(token, chat, "Jam batas? (0–23, angka saja)")
+      return
+    }
+    if (!/^\d+$/.test(t)) {
+      await send(token, chat, "Angka saja.")
+      return
+    }
+    const n = Number(t)
+    if (cfg.ask === "jam") {
+      if (n > 23) {
+        await send(token, chat, "Jam 0–23.")
+        return
+      }
+      cfg.hours = n
+      cfg.ask = "menit"
+      saveCfg(cfg)
+      await send(token, chat, "Menit batas? (0–59, angka saja)")
+      return
+    }
+    if (n > 59) {
+      await send(token, chat, "Menit 0–59.")
+      return
+    }
+    cfg.minutes = n
+    cfg.until = untilMs(cfg.askY, cfg.askM, cfg.askD, cfg.hours, cfg.minutes)
+    cfg.ask = ""
+    cfg.timer = true
+    saveCfg(cfg)
+    if (!cfg.until) {
+      await send(token, chat, "Tanggal/jam tidak valid. Timer ON lagi.")
+      return
+    }
+    await send(token, chat, `Timer ON sampai\n${fmtWib(cfg.until)}`, { reply_markup: presensiInline(cfg) })
+    return
+  }
   if (t === "/tugas" || t === "Tugas") {
+    const c = loadCfg()
+    if (c.ask) {
+      c.ask = ""
+      saveCfg(c)
+    }
     await send(token, chat, "Ambil tugas belum…")
     await send(token, chat, await textTugas(cookie, file))
     return
   }
   if (t === "/materi" || t === "Materi") {
+    const c = loadCfg()
+    if (c.ask) {
+      c.ask = ""
+      saveCfg(c)
+    }
     const cs = await courses(cookie, file)
-    const buttons = cs.map((c) => [{
-      text: c.matakuliah.nama.slice(0, 60),
-      callback_data: `m:${c.nomor}:${c.jenisSchema}`,
+    const buttons = cs.map((c0) => [{
+      text: c0.matakuliah.nama.slice(0, 60),
+      callback_data: `m:${c0.nomor}:${c0.jenisSchema}`,
     }])
     await send(token, chat, "Pilih matakuliah:", { reply_markup: { inline_keyboard: buttons } })
     return
   }
   if (t === "/jadwal" || t === "Jadwal") {
+    const c = loadCfg()
+    if (c.ask) {
+      c.ask = ""
+      saveCfg(c)
+    }
     await send(token, chat, "Ambil jadwal…")
     await send(token, chat, await textJadwal(cookie, file))
+    return
+  }
+  if (t === "/presensi" || t === "Presensi") {
+    if (!owner) {
+      await send(token, chat, "Presensi cuma di chat owner.")
+      return
+    }
+    const c = loadCfg()
+    c.ask = ""
+    saveCfg(c)
+    await sendPresensiPanel(token, chat, cookie, file)
   }
 }
 
@@ -544,6 +925,7 @@ async function telegramInbox(token: string) {
       { command: "tugas", description: "Tugas belum dikumpulkan" },
       { command: "materi", description: "Materi (pilih matkul + link)" },
       { command: "jadwal", description: "Jadwal seminggu" },
+      { command: "presensi", description: "Auto-presensi (toggle + timer)" },
       { command: "login", description: "Status akun ETHOL" },
       { command: "menu", description: "Menu" },
     ],
@@ -552,27 +934,55 @@ async function telegramInbox(token: string) {
   for (;;) {
     try {
       const r = await fetch(`${TG}${token}/getUpdates?timeout=50&offset=${offset}`)
+      if (!r.ok) throw new Error(`telegram getUpdates ${r.status} ${(await r.text()).slice(0, 120)}`)
       const data = (await r.json()) as { result?: any[] }
       for (const u of data.result ?? []) {
         offset = u.update_id + 1
         const msg = u.message
         const cb = u.callback_query
-        if (msg?.text) await handleMsg(token, String(msg.chat.id), msg.text)
+        if (msg?.text) {
+          try {
+            await handleMsg(token, String(msg.chat.id), msg.text)
+          } catch (e) {
+            await report(token, String(msg.chat.id), e)
+          }
+        }
         if (cb?.data) {
           const chat = String(cb.message?.chat?.id ?? "")
-          await tg(token, "answerCallbackQuery", { callback_query_id: cb.id })
-          const cookie = cookieFor(chat)
-          if (!cookie) {
-            await send(token, chat, LOGIN_HELP)
-            continue
+          try {
+            await tg(token, "answerCallbackQuery", { callback_query_id: cb.id })
+            if (cb.data === "p:vnc" || cb.data === "p:done") {
+              if (chat !== env("TELEGRAM_CHAT_ID")) {
+                await send(token, chat, "Cuma owner.")
+                continue
+              }
+              if (cb.data === "p:vnc") await openVnc(token, chat)
+              else await finishVnc(token, chat)
+              continue
+            }
+            const cookie = cookieFor(chat)
+            if (!cookie) {
+              await send(token, chat, LOGIN_HELP)
+              continue
+            }
+            const file = chat === env("TELEGRAM_CHAT_ID") ? COOKIE_FILE : sessionFile(chat)
+            if (cb.data === "p:auto" || cb.data === "p:timer") {
+              if (chat !== env("TELEGRAM_CHAT_ID")) {
+                await send(token, chat, "Presensi cuma di chat owner.")
+                continue
+              }
+              await handlePresensiCb(token, chat, cookie, file, cb.data)
+              continue
+            }
+            const m = /^m:(\d+):(\d+)$/.exec(cb.data)
+            if (m) await send(token, chat, await textMateri(cookie, file, m[1], m[2]))
+          } catch (e) {
+            await report(token, chat, e)
           }
-          const file = chat === env("TELEGRAM_CHAT_ID") ? COOKIE_FILE : sessionFile(chat)
-          const m = /^m:(\d+):(\d+)$/.exec(cb.data)
-          if (m) await send(token, chat, await textMateri(cookie, file, m[1], m[2]))
         }
       }
     } catch (e) {
-      console.error("inbox", e instanceof Error ? e.message : e)
+      logLine(`inbox ${e instanceof Error ? e.message : e}`)
       await new Promise((r) => setTimeout(r, 3000))
     }
   }
@@ -604,6 +1014,7 @@ function serve() {
   })
   s.listen(PORT, "127.0.0.1", () => {
     console.log(`http://127.0.0.1:${PORT}/`)
+    reapDeadLogin().catch((e) => logLine(`reap ${e instanceof Error ? e.message : e}`))
     const token = env("TELEGRAM_BOT_TOKEN")
     const chat = env("TELEGRAM_CHAT_ID")
     if (token && chat) {

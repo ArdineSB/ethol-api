@@ -25,13 +25,12 @@ Bukan ganti password kampus. Bukan share satu session.
 
 ## Non-goals
 
-- Auto-klik / submit Presensi (sekarang, nanti, project terpisah: **tidak**). Alasan: bot tidak bisa verifikasi kehadiran fisik; auto-submit = pemalsuan rekor akademik; multi-akun = alat curang massal. Lihat hub vault.
 - Scrape DOM kalau REST cukup.
 - n8n.
 - Bot Telegram per orang.
 - Push realtime dari kampus (tidak ada).
 
-Boleh nanti: alert “presensi dosen baru dibuka” (baca status, bukan submit).
+Boleh: alert “presensi dosen baru dibuka” dan auto-klik Presensi (`POST /presensi/mahasiswa`) saat `open === 1`.
 
 ## Diagnosis
 
@@ -39,7 +38,7 @@ Boleh nanti: alert “presensi dosen baru dibuka” (baca status, bukan submit).
 |---|---|
 | Data | ETHOL sudah REST (`https://ethol.pens.ac.id/api`). |
 | Perilaku | Orang tidak buka web → lonceng/tugas terlewat. |
-| Absen lupa | Informasi (tidak tahu presensi buka). Perbaikan: alert. Bukan auto-hadir. |
+| Absen lupa | Alert saat presensi buka + auto-klik `POST /presensi/mahasiswa` saat `open === 1`. |
 
 Recon 2026-09-05: SPA React, cookie `withCredentials`, CAS SSO. Lonceng: GET list + unread count. Klik item = PUT baca. Tidak ada websocket/FCM.
 
@@ -72,7 +71,8 @@ Bentuk JSON **kita**, bukan mirror mentah ETHOL. Field ETHOL di-map.
 | `/v1/assignments` | tugas | tidak |
 | `/v1/materials` | materi | tidak |
 | `/v1/attendance/history` | riwayat | tidak |
-| `/v1/attendance/open` | apakah presensi kuliah sedang buka | tidak submit |
+| `/v1/attendance/open` | apakah presensi kuliah sedang buka | — |
+| `/v1/attendance/checkin` | klik Presensi mahasiswa | `POST /presensi/mahasiswa` saat `open === 1` |
 
 Upstream (kampus), mahasiswa — mapped 2026-09-05 from SPA bundle (see `recon-ethol.md`):
 
@@ -86,8 +86,9 @@ Upstream (kampus), mahasiswa — mapped 2026-09-05 from SPA bundle (see `recon-e
 | `/v1/materials` | `GET /materi?matakuliah&jenis_schema` |
 | `/v1/attendance/history` | `GET /presensi/riwayat?kuliah&jenis_schema&nomor` |
 | `/v1/attendance/open` | `GET /presensi/aktif-kuliah` — treat `open === 1` as buka |
+| `/v1/attendance/checkin` | `POST /presensi/mahasiswa` saat `open === 1` |
 
-Jangan panggil: `PUT /notifikasi/mahasiswa-baca-notif`, `POST /presensi/mahasiswa`, `POST|PUT /tugas/submit`.
+Jangan panggil: `PUT /notifikasi/mahasiswa-baca-notif`, `POST|PUT /tugas/submit`, dosen `POST /presensi/buka` / `PUT /presensi/tutup` / `PUT /presensi/batalkan`. Auto-presensi mahasiswa: `POST /presensi/mahasiswa` saat `open === 1`.
 
 ## Auth
 
